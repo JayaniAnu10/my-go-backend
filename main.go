@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
@@ -28,8 +29,17 @@ var (
 	mu     sync.Mutex
 )
 
+// insecure HTTP client — needed because ThunderID uses self-signed certificate
+var insecureClient = &http.Client{
+	Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	},
+}
+
 func validateToken(tokenString string) (jwt.MapClaims, error) {
-	resp, err := http.Get("https://localhost:8090/oauth2/jwks")
+	// Use your Mac's IP (192.168.5.2) instead of localhost
+	// because inside the cluster, localhost means the container itself
+	resp, err := insecureClient.Get("https://192.168.5.2:8090/oauth2/jwks")
 	if err != nil {
 		return nil, fmt.Errorf("could not fetch JWKS: %v", err)
 	}
