@@ -54,13 +54,12 @@ type Todo struct {
 // ─── JWT ──────────────────────────────────────────────────────────────────────
 
 var insecureClient = &http.Client{
-	Timeout: 5 * time.Second, // ← fail fast if ThunderID is down
+	Timeout: 5 * time.Second,
 	Transport: &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	},
 }
 
-// cache the public key so we don't fetch ThunderID on every request
 var (
 	cachedPublicKey interface{}
 	cachedKeyMu     sync.Mutex
@@ -121,6 +120,45 @@ func validateToken(tokenString string) (jwt.MapClaims, error) {
 	return token.Claims.(jwt.MapClaims), nil
 }
 
+// ─── Role resolver ────────────────────────────────────────────────────────────
+
+func resolveRole(claims jwt.MapClaims) string {
+	candidateKeys := []string{
+		"roles", "role", "groups", "permissions",
+		"http://schemas.microsoft.com/ws/2008/06/identity/claims/role",
+	}
+
+	normalizeRole := func(value string) string {
+		lower := strings.ToLower(value)
+		if strings.Contains(lower, "admin") || strings.Contains(lower, "owner") {
+			return "admin"
+		}
+		if strings.Contains(lower, "user") || strings.Contains(lower, "member") {
+			return "user"
+		}
+		return ""
+	}
+
+	for _, key := range candidateKeys {
+		val := claims[key]
+		if arr, ok := val.([]interface{}); ok {
+			for _, item := range arr {
+				if s, ok := item.(string); ok {
+					if role := normalizeRole(s); role != "" {
+						return role
+					}
+				}
+			}
+		}
+		if s, ok := val.(string); ok {
+			if role := normalizeRole(s); role != "" {
+				return role
+			}
+		}
+	}
+	return "user"
+}
+
 // ─── Middleware ───────────────────────────────────────────────────────────────
 
 func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
@@ -141,13 +179,21 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
+		// Extract email
 		email := ""
 		if e, ok := claims["email"].(string); ok {
 			email = e
 		} else if sub, ok := claims["sub"].(string); ok {
 			email = sub
 		}
+
+		// Extract role
+		role := resolveRole(claims)
+
 		r.Header.Set("X-User-Email", email)
+		r.Header.Set("X-User-Role", role)
+
+		log.Printf("Request: %s %s | user: %s | role: %s", r.Method, r.URL.Path, email, role)
 		next(w, r)
 	}
 }
@@ -155,7 +201,20 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
 func getTodos(w http.ResponseWriter, r *http.Request) {
-	rows, err := db.Query("SELECT id, text, done, created_by FROM todos ORDER BY id DESC")
+	email := r.Header.Get("X-User-Email")
+	role := r.Header.Get("X-User-Role")
+
+	var rows *sql.Rows
+	var err error
+
+	if role == "admin" {
+		// Admin sees ALL todos from ALL users
+		rows, err = db.Query("SELECT id, text, done, created_by FROM todos ORDER BY id DESC")
+	} else {
+		// Regular user sees ONLY their own todos
+		rows, err = db.Query("SELECT id, text, done, created_by FROM todos WHERE created_by = ? ORDER BY id DESC", email)
+	}
+
 	if err != nil {
 		log.Println("DB error:", err)
 		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
@@ -204,7 +263,20 @@ func deleteTodo(w http.ResponseWriter, r *http.Request) {
 	var id int
 	fmt.Sscanf(idStr, "%d", &id)
 
-	result, err := db.Exec("DELETE FROM todos WHERE id = ?", id)
+	email := r.Header.Get("X-User-Email")
+	role := r.Header.Get("X-User-Role")
+
+	var result sql.Result
+	var err error
+
+	if role == "admin" {
+		// Admin can delete any todo
+		result, err = db.Exec("DELETE FROM todos WHERE id = ?", id)
+	} else {
+		// User can only delete their own todos
+		result, err = db.Exec("DELETE FROM todos WHERE id = ? AND created_by = ?", id, email)
+	}
+
 	if err != nil {
 		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
 		return
@@ -212,7 +284,7 @@ func deleteTodo(w http.ResponseWriter, r *http.Request) {
 
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		http.Error(w, `{"error":"not found or not authorized"}`, http.StatusNotFound)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
