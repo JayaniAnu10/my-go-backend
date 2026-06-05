@@ -24,7 +24,7 @@ type Todo struct {
 }
 
 var (
-	todos  []Todo
+	todos  = []Todo{}
 	nextID = 1
 	mu     sync.Mutex
 )
@@ -106,6 +106,9 @@ func getTodos(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	defer mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
+	if todos == nil {
+        todos = []Todo{}
+    }
 	json.NewEncoder(w).Encode(todos)
 }
 
