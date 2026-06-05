@@ -3,18 +3,46 @@ package main
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"database/sql"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"log"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/mattn/go-sqlite3"
 	"github.com/rs/cors"
 )
+
+// ─── Database ─────────────────────────────────────────────────────────────────
+
+var db *sql.DB
+
+func initDB() {
+	var err error
+	db, err = sql.Open("sqlite3", "/app/data/todos.db")
+	if err != nil {
+		log.Fatal("Failed to open database:", err)
+	}
+
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS todos (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			text TEXT NOT NULL,
+			done BOOLEAN DEFAULT FALSE,
+			created_by TEXT
+		)
+	`)
+	if err != nil {
+		log.Fatal("Failed to create table:", err)
+	}
+	log.Println("✓ Database initialized at /app/data/todos.db")
+}
+
+// ─── Types ────────────────────────────────────────────────────────────────────
 
 type Todo struct {
 	ID        int    `json:"id"`
@@ -23,13 +51,8 @@ type Todo struct {
 	CreatedBy string `json:"created_by"`
 }
 
-var (
-	todos  = []Todo{}
-	nextID = 1
-	mu     sync.Mutex
-)
+// ─── JWT ──────────────────────────────────────────────────────────────────────
 
-// insecure HTTP client — needed because ThunderID uses self-signed certificate
 var insecureClient = &http.Client{
 	Transport: &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
@@ -37,8 +60,6 @@ var insecureClient = &http.Client{
 }
 
 func validateToken(tokenString string) (jwt.MapClaims, error) {
-	// Use your Mac's IP (192.168.5.2) instead of localhost
-	// because inside the cluster, localhost means the container itself
 	resp, err := insecureClient.Get("https://192.168.5.2:8090/oauth2/jwks")
 	if err != nil {
 		return nil, fmt.Errorf("could not fetch JWKS: %v", err)
@@ -74,6 +95,8 @@ func validateToken(tokenString string) (jwt.MapClaims, error) {
 	return token.Claims.(jwt.MapClaims), nil
 }
 
+// ─── Middleware ───────────────────────────────────────────────────────────────
+
 func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		authHeader := r.Header.Get("Authorization")
@@ -102,13 +125,24 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// ─── Handlers ─────────────────────────────────────────────────────────────────
+
 func getTodos(w http.ResponseWriter, r *http.Request) {
-	mu.Lock()
-	defer mu.Unlock()
+	rows, err := db.Query("SELECT id, text, done, created_by FROM todos ORDER BY id DESC")
+	if err != nil {
+		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	todos := []Todo{}
+	for rows.Next() {
+		var t Todo
+		rows.Scan(&t.ID, &t.Text, &t.Done, &t.CreatedBy)
+		todos = append(todos, t)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	if todos == nil {
-        todos = []Todo{}
-    }
 	json.NewEncoder(w).Encode(todos)
 }
 
@@ -121,16 +155,15 @@ func createTodo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mu.Lock()
-	todo := Todo{
-		ID:        nextID,
-		Text:      body.Text,
-		Done:      false,
-		CreatedBy: r.Header.Get("X-User-Email"),
+	email := r.Header.Get("X-User-Email")
+	result, err := db.Exec("INSERT INTO todos (text, done, created_by) VALUES (?, false, ?)", body.Text, email)
+	if err != nil {
+		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
+		return
 	}
-	todos = append(todos, todo)
-	nextID++
-	mu.Unlock()
+
+	id, _ := result.LastInsertId()
+	todo := Todo{ID: int(id), Text: body.Text, Done: false, CreatedBy: email}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -142,16 +175,18 @@ func deleteTodo(w http.ResponseWriter, r *http.Request) {
 	var id int
 	fmt.Sscanf(idStr, "%d", &id)
 
-	mu.Lock()
-	defer mu.Unlock()
-	for i, t := range todos {
-		if t.ID == id {
-			todos = append(todos[:i], todos[i+1:]...)
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
+	result, err := db.Exec("DELETE FROM todos WHERE id = ?", id)
+	if err != nil {
+		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
+		return
 	}
-	http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func healthCheck(w http.ResponseWriter, r *http.Request) {
@@ -162,7 +197,11 @@ func healthCheck(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ─── Main ─────────────────────────────────────────────────────────────────────
+
 func main() {
+	initDB()
+
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/health", healthCheck)
@@ -197,6 +236,7 @@ func main() {
 	}).Handler(mux)
 
 	log.Println("✓ Backend running on http://localhost:8081")
+	log.Println("✓ Database: /app/data/todos.db")
 	log.Println("✓ Endpoints: GET/POST /todos, DELETE /todos/:id, GET /health")
 	log.Fatal(http.ListenAndServe(":8081", handler))
 }
