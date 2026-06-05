@@ -1,20 +1,21 @@
 package main
 
 import (
-    "crypto/tls"
-    "crypto/x509"
-    "database/sql"
-    "encoding/json"
-    "encoding/pem"
-    "fmt"
-    "log"
-    "net/http"
-    "strings"
-    "time"
+	"crypto/tls"
+	"crypto/x509"
+	"database/sql"
+	"encoding/json"
+	"encoding/pem"
+	"fmt"
+	"log"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
 
-    "github.com/golang-jwt/jwt/v5"
-    _ "github.com/mattn/go-sqlite3"  // ← underscore means "import for side effects only"
-    "github.com/rs/cors"
+	"github.com/golang-jwt/jwt/v5"
+	_ "github.com/mattn/go-sqlite3"
+	"github.com/rs/cors"
 )
 
 // ─── Database ─────────────────────────────────────────────────────────────────
@@ -27,7 +28,6 @@ func initDB() {
 	if err != nil {
 		log.Fatal("Failed to open database:", err)
 	}
-
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS todos (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -54,12 +54,27 @@ type Todo struct {
 // ─── JWT ──────────────────────────────────────────────────────────────────────
 
 var insecureClient = &http.Client{
+	Timeout: 5 * time.Second, // ← fail fast if ThunderID is down
 	Transport: &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	},
 }
 
-func validateToken(tokenString string) (jwt.MapClaims, error) {
+// cache the public key so we don't fetch ThunderID on every request
+var (
+	cachedPublicKey interface{}
+	cachedKeyMu     sync.Mutex
+)
+
+func getPublicKey() (interface{}, error) {
+	cachedKeyMu.Lock()
+	defer cachedKeyMu.Unlock()
+
+	if cachedPublicKey != nil {
+		return cachedPublicKey, nil
+	}
+
+	log.Println("Fetching JWKS from ThunderID...")
 	resp, err := insecureClient.Get("https://192.168.5.2:8090/oauth2/jwks")
 	if err != nil {
 		return nil, fmt.Errorf("could not fetch JWKS: %v", err)
@@ -84,8 +99,19 @@ func validateToken(tokenString string) (jwt.MapClaims, error) {
 		return nil, fmt.Errorf("could not parse cert: %v", err)
 	}
 
+	cachedPublicKey = cert.PublicKey
+	log.Println("✓ JWKS fetched and cached successfully")
+	return cachedPublicKey, nil
+}
+
+func validateToken(tokenString string) (jwt.MapClaims, error) {
+	publicKey, err := getPublicKey()
+	if err != nil {
+		return nil, err
+	}
+
 	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-		return cert.PublicKey, nil
+		return publicKey, nil
 	}, jwt.WithoutClaimsValidation())
 
 	if err != nil || !token.Valid {
@@ -109,6 +135,7 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		tokenString := strings.TrimPrefix(authHeader, "Bearer ")
 		claims, err := validateToken(tokenString)
 		if err != nil {
+			log.Println("Token validation failed:", err)
 			w.Header().Set("Content-Type", "application/json")
 			http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
 			return
@@ -130,6 +157,7 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 func getTodos(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query("SELECT id, text, done, created_by FROM todos ORDER BY id DESC")
 	if err != nil {
+		log.Println("DB error:", err)
 		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
 		return
 	}
@@ -158,6 +186,7 @@ func createTodo(w http.ResponseWriter, r *http.Request) {
 	email := r.Header.Get("X-User-Email")
 	result, err := db.Exec("INSERT INTO todos (text, done, created_by) VALUES (?, false, ?)", body.Text, email)
 	if err != nil {
+		log.Println("DB error:", err)
 		http.Error(w, `{"error":"db error"}`, http.StatusInternalServerError)
 		return
 	}
