@@ -1,20 +1,20 @@
 package main
 
 import (
-	"crypto/tls"
-	"crypto/x509"
-	"database/sql"
-	"encoding/json"
-	"encoding/pem"
-	"fmt"
-	"log"
-	"net/http"
-	"strings"
-	"time"
+    "crypto/tls"
+    "crypto/x509"
+    "database/sql"
+    "encoding/json"
+    "encoding/pem"
+    "fmt"
+    "log"
+    "net/http"
+    "strings"
+    "time"
 
-	"github.com/golang-jwt/jwt/v5"
-	"github.com/mattn/go-sqlite3"
-	"github.com/rs/cors"
+    "github.com/golang-jwt/jwt/v5"
+    _ "github.com/mattn/go-sqlite3"  // ← underscore means "import for side effects only"
+    "github.com/rs/cors"
 )
 
 // ─── Database ─────────────────────────────────────────────────────────────────
