@@ -74,7 +74,7 @@ func getPublicKey() (interface{}, error) {
 	}
 
 	log.Println("Fetching JWKS from ThunderID...")
-	resp, err := insecureClient.Get("https://192.168.5.2:8090/oauth2/jwks")
+	resp, err := insecureClient.Get("https://192.168.5.1:8090/oauth2/jwks")
 	if err != nil {
 		return nil, fmt.Errorf("could not fetch JWKS: %v", err)
 	}
@@ -329,7 +329,7 @@ func main() {
 	handler := cors.New(cors.Options{
 		AllowedOrigins: []string{
 			"http://localhost:5173",
-			"http://192.168.5.2",
+			"http://192.168.5.1",
 			"http://endpoint-1-frontend-development-default-ec673672.openchoreoapis.localhost:19080",
 		},
 		AllowedMethods: []string{"GET", "POST", "DELETE", "OPTIONS"},
