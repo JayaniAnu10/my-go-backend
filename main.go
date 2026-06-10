@@ -74,7 +74,7 @@ func getPublicKey() (interface{}, error) {
 	}
 
 	log.Println("Fetching JWKS from ThunderID...")
-	resp, err := insecureClient.Get("http://192.168.5.1:8090/oauth2/jwks")
+	resp, err := insecureClient.Get("http://thunder-service.thunder.svc.cluster.local:8090/oauth2/jwks")
 	if err != nil {
 		return nil, fmt.Errorf("could not fetch JWKS: %v", err)
 	}
