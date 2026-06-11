@@ -63,13 +63,15 @@ var insecureClient = &http.Client{
 var (
 	cachedPublicKey interface{}
 	cachedKeyMu     sync.Mutex
+	cachedKeyTime   time.Time
+	cacheTTL        = 5 * time.Minute
 )
 
 func getPublicKey() (interface{}, error) {
 	cachedKeyMu.Lock()
 	defer cachedKeyMu.Unlock()
 
-	if cachedPublicKey != nil {
+	if cachedPublicKey != nil && time.Since(cachedKeyTime) < cacheTTL {
 		return cachedPublicKey, nil
 	}
 
@@ -99,8 +101,15 @@ func getPublicKey() (interface{}, error) {
 	}
 
 	cachedPublicKey = cert.PublicKey
+	cachedKeyTime = time.Now()
 	log.Println("✓ JWKS fetched and cached successfully")
 	return cachedPublicKey, nil
+}
+
+func invalidateCache() {
+	cachedKeyMu.Lock()
+	cachedPublicKey = nil
+	cachedKeyMu.Unlock()
 }
 
 func validateToken(tokenString string) (jwt.MapClaims, error) {
@@ -114,7 +123,22 @@ func validateToken(tokenString string) (jwt.MapClaims, error) {
 	}, jwt.WithoutClaimsValidation())
 
 	if err != nil || !token.Valid {
-		return nil, fmt.Errorf("invalid token: %v", err)
+		// Force cache invalidation and retry once in case ThunderID restarted
+		log.Println("Token validation failed, invalidating JWKS cache and retrying...")
+		invalidateCache()
+
+		publicKey, err = getPublicKey()
+		if err != nil {
+			return nil, err
+		}
+
+		token, err = jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+			return publicKey, nil
+		}, jwt.WithoutClaimsValidation())
+
+		if err != nil || !token.Valid {
+			return nil, fmt.Errorf("invalid token: %v", err)
+		}
 	}
 
 	return token.Claims.(jwt.MapClaims), nil
@@ -208,10 +232,8 @@ func getTodos(w http.ResponseWriter, r *http.Request) {
 	var err error
 
 	if role == "admin" {
-		// Admin sees ALL todos from ALL users
 		rows, err = db.Query("SELECT id, text, done, created_by FROM todos ORDER BY id DESC")
 	} else {
-		// Regular user sees ONLY their own todos
 		rows, err = db.Query("SELECT id, text, done, created_by FROM todos WHERE created_by = ? ORDER BY id DESC", email)
 	}
 
@@ -270,10 +292,8 @@ func deleteTodo(w http.ResponseWriter, r *http.Request) {
 	var err error
 
 	if role == "admin" {
-		// Admin can delete any todo
 		result, err = db.Exec("DELETE FROM todos WHERE id = ?", id)
 	} else {
-		// User can only delete their own todos
 		result, err = db.Exec("DELETE FROM todos WHERE id = ? AND created_by = ?", id, email)
 	}
 
